@@ -6,6 +6,16 @@ const AUDIT_WORKER_URL = 'https://tagmakes-proxy.tagmakes.workers.dev'
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE)
 
+// Extract access code from source field
+// source is stored as "agency_dashboard_HALEY2026" or "legacy" etc.
+function extractAccessCode(source) {
+  if (!source) return null
+  if (source.startsWith('agency_dashboard_')) {
+    return source.replace('agency_dashboard_', '')
+  }
+  return null
+}
+
 async function run() {
   console.log('Claiming jobs...')
   const { data: jobs, error } = await supabase.rpc('claim_audit_queue', { batch_size: 50 })
@@ -31,10 +41,69 @@ async function run() {
         ? project.domain
         : `https://${project.domain}`
 
-      console.log(`Running audit for ${siteUrl} | ${job.query}`)
+      // Pull access code from queue job source
+      const accessCode = extractAccessCode(job.source)
+      console.log(`Running audit for ${siteUrl} | query: ${job.query} | accessCode: ${accessCode || 'none (public)'}`)
 
       const response = await fetch(AUDIT_WORKER_URL, {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          siteUrl,
+          query: job.query,
+          accessCode: accessCode || 'public'
+        })
+      })
+
+      const resultText = await response.text()
+
+      if (!response.ok) {
+        throw new Error(`Worker error ${response.status}: ${resultText}`)
+      }
+
+      await supabase
+        .from('audit_queue')
+        .update({
+          status: 'done',
+          processed_at: new Date().toISOString(),
+          last_error: null
+        })
+        .eq('id', job.id)
+
+      // Write location back to projects so market_name trigger fires
+      try {
+        const result = JSON.parse(resultText)
+        const parsed = result.text ? JSON.parse(result.text) : result
+        const location = parsed?.business_location_detected || null
+        if (location) {
+          await supabase
+            .from('projects')
+            .update({ location_city: location })
+            .eq('id', job.project_id)
+            .is('location_city', null)
+          console.log(`Location set: ${location} -> ${project.domain}`)
+        }
+      } catch(e) {
+        console.log('Location parse skipped:', e.message)
+      }
+
+      console.log(`Completed: ${siteUrl}`)
+
+    } catch (err) {
+      console.error('Audit failed:', err.message)
+      const tooManyAttempts = (job.attempts || 0) >= 3
+      await supabase
+        .from('audit_queue')
+        .update({
+          status: tooManyAttempts ? 'failed' : 'pending',
+          last_error: err.message
+        })
+        .eq('id', job.id)
+    }
+  }
+}
+
+run()        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ siteUrl, query: job.query })
       })
