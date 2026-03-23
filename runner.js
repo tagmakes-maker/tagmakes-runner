@@ -67,11 +67,10 @@ async function checkModelHealth() {
       }
     }
 
-    return { healthy: false, activeModels, missingModels }
+    // Log only, do not block
   }
 
-  console.log('Model health check: all 4 models active')
-  return { healthy: true }
+  console.log('Model health check: ' + activeModels.length + '/4 models seen in last 2h')
 }
 
 // Item 7: Reset jobs stuck in processing for more than 10 minutes
@@ -111,12 +110,8 @@ async function run() {
   // Reset stuck jobs before claiming new ones
   await resetStuckJobs()
 
-  // Check model health before processing
-  const health = await checkModelHealth()
-  if (!health.healthy) {
-    console.log('Skipping batch: not all models are writing. Will retry next cycle.')
-    return
-  }
+  // Model health: log only, never block
+  try { await checkModelHealth() } catch(e) { console.warn('Health check error (ignored):', e.message) }
 
   console.log('Claiming jobs...')
   const { data: jobs, error } = await supabase.rpc('claim_audit_queue', { batch_size: 50 })
