@@ -138,6 +138,23 @@ async function run() {
         throw new Error(`Project lookup failed for ${job.project_id}`)
       }
 
+      // 24-hour requeue cap: max 2 per domain per day
+      const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+      const { count: recentCount } = await supabase
+        .from('audit_queue')
+        .select('id', { count: 'exact', head: true })
+        .eq('project_id', job.project_id)
+        .gte('created_at', oneDayAgo)
+
+      if ((recentCount || 0) > 2) {
+        console.log(`Skipping ${project.domain}: ${recentCount} queue entries in last 24h (cap is 2)`)
+        await supabase
+          .from('audit_queue')
+          .update({ status: 'skipped', last_error: 'Requeue cap: >2 in 24h' })
+          .eq('id', job.id)
+        continue
+      }
+
       const siteUrl = project.domain.startsWith('http')
         ? project.domain
         : `https://${project.domain}`
