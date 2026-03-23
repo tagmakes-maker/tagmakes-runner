@@ -82,7 +82,7 @@ async function resetStuckJobs() {
     .from('audit_queue')
     .select('id, attempts')
     .eq('status', 'processing')
-    .lt('claimed_at', tenMinutesAgo)
+    .lt('updated_at', tenMinutesAgo)
 
   if (error) {
     console.error('Stuck job check failed:', error.message)
