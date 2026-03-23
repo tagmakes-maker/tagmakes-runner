@@ -138,28 +138,31 @@ async function run() {
         throw new Error(`Project lookup failed for ${job.project_id}`)
       }
 
-      // 24-hour requeue cap: max 2 per domain per day
-      const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
-      const { count: recentCount } = await supabase
-        .from('audit_queue')
-        .select('id', { count: 'exact', head: true })
-        .eq('project_id', job.project_id)
-        .gte('created_at', oneDayAgo)
-
-      if ((recentCount || 0) > 2) {
-        console.log(`Skipping ${project.domain}: ${recentCount} queue entries in last 24h (cap is 2)`)
-        await supabase
+      // 24-hour requeue cap: max 2 per domain per day (public audits only)
+      const accessCode = extractAccessCode(job.source)
+      const isPublic = !accessCode || accessCode === 'public'
+      if (isPublic) {
+        const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+        const { count: recentCount } = await supabase
           .from('audit_queue')
-          .update({ status: 'skipped', last_error: 'Requeue cap: >2 in 24h' })
-          .eq('id', job.id)
-        continue
+          .select('id', { count: 'exact', head: true })
+          .eq('project_id', job.project_id)
+          .gte('created_at', oneDayAgo)
+
+        if ((recentCount || 0) > 2) {
+          console.log(`Skipping ${project.domain}: ${recentCount} public queue entries in last 24h (cap is 2)`)
+          await supabase
+            .from('audit_queue')
+            .update({ status: 'skipped', last_error: 'Public requeue cap: >2 in 24h' })
+            .eq('id', job.id)
+          continue
+        }
       }
 
       const siteUrl = project.domain.startsWith('http')
         ? project.domain
         : `https://${project.domain}`
 
-      const accessCode = extractAccessCode(job.source)
       console.log(`Running audit for ${siteUrl} | query: ${job.query} | accessCode: ${accessCode || 'none (public)'}`)
 
       const response = await fetch(AUDIT_WORKER_URL, {
