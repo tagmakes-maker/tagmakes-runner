@@ -173,6 +173,21 @@ async function run() {
       const resultText = await response.text()
 
       if (!response.ok) {
+        // Check if worker flagged this as an invalid URL — no point retrying
+        let isInvalidUrl = false
+        try { isInvalidUrl = JSON.parse(resultText).invalid_url === true } catch(e) {}
+        if (isInvalidUrl) {
+          console.log(`Invalid URL for ${siteUrl}, marking done: ${resultText.slice(0, 200)}`)
+          await supabase
+            .from('audit_queue')
+            .update({
+              status:       'done',
+              processed_at: new Date().toISOString(),
+              last_error:   'invalid_url: ' + resultText.slice(0, 500)
+            })
+            .eq('id', job.id)
+          continue
+        }
         throw new Error(`Worker error ${response.status}: ${resultText}`)
       }
 
