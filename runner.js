@@ -796,6 +796,7 @@ async function processDirectCheap(jobs) {
   console.log(`Processing ${jobs.length} jobs direct with cheap models`)
 
   const VERSIONS = { chatgpt: 'gpt-4o-mini', claude: 'claude-haiku-4-5-20251001', gemini: 'gemini-2.5-flash', perplexity: 'sonar' }
+  const allModelOutputs = []
 
   await withConcurrency(jobs, 5, async (job) => {
     try {
@@ -828,6 +829,7 @@ async function processDirectCheap(jobs) {
       if (geminiR.status === 'rejected') console.error(`[cheap] Gemini failed for ${siteUrl}: ${geminiR.reason?.message}`)
       if (perplexityR.status === 'rejected') console.error(`[cheap] Perplexity failed for ${siteUrl}: ${perplexityR.reason?.message}`)
 
+      allModelOutputs.push(modelOutputs)
       const auditId = await writeAuditResults(job, project, siteUrl, normalizedDomain, job.query, modelOutputs, VERSIONS)
       if (auditId) {
         await supabase.from('audit_queue').update({ status: 'done', processed_at: new Date().toISOString(), last_error: null }).eq('id', job.id)
@@ -841,6 +843,18 @@ async function processDirectCheap(jobs) {
       await supabase.from('audit_queue').update({ status: tooManyAttempts ? 'failed' : 'pending', last_error: err.message }).eq('id', job.id)
     }
   })
+
+  // Check if any model failed on >50% of jobs
+  if (allModelOutputs.length >= 3) {
+    for (const model of ['claude', 'chatgpt', 'gemini', 'perplexity']) {
+      const { fails, total, rate } = checkModelFailureRate(allModelOutputs, model)
+      if (rate > 0.5) {
+        console.error(`[cheap] ${model} failed on ${fails}/${total} jobs (${Math.round(rate * 100)}%)`)
+        return false
+      }
+    }
+  }
+  return true
 }
 
 // ── PROCESS BATCH: SERPER SEED ──────────────────────────────
@@ -922,6 +936,14 @@ async function processBatchSerperSeed(jobs) {
     console.log(`[batch] Anthropic batch completed: ${anthropicResults.size} results`)
   } else {
     console.error(`[batch] Anthropic batch failed: ${antBatchResult.reason?.message}`)
+  }
+
+  // Check for wholesale batch failures - if either batch API totally failed, pause remaining seed queue
+  const oaiFailed = oaiBatchResult.status === 'rejected'
+  const antFailed = antBatchResult.status === 'rejected'
+  if (oaiFailed || antFailed) {
+    const failedAPIs = [oaiFailed && 'OpenAI', antFailed && 'Anthropic'].filter(Boolean).join(' + ')
+    await pauseSeedJobs([], `Batch API failure: ${failedAPIs} - ${oaiFailed ? oaiBatchResult.reason?.message : ''} ${antFailed ? antBatchResult.reason?.message : ''}`.trim())
   }
 
   // Phase 4: Merge results and write to DB
@@ -1009,6 +1031,42 @@ async function resetStuckJobs() {
   }
 }
 
+// ── SEED PAUSE + ALERT ──────────────────────────────────────
+
+async function pauseSeedJobs(jobs, reason) {
+  for (const job of jobs) {
+    await supabase.from('audit_queue').update({ status: 'pending', last_error: reason }).eq('id', job.id)
+  }
+  console.log(`Paused ${jobs.length} seed jobs: ${reason}`)
+
+  if (RESEND_KEY) {
+    try {
+      const { count } = await supabase.from('audit_queue').select('id', { count: 'exact', head: true }).eq('status', 'pending').eq('source', 'serper_seed')
+      await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + RESEND_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: 'TaG Makes <reports@tagmakessc.com>',
+          to: 'therese@tagmakessc.com',
+          subject: 'ARO Seed paused - model failures detected',
+          html: `<p><strong>Reason:</strong> ${reason}</p><p><strong>Pending seed jobs:</strong> ${count || 0}</p><p><strong>At:</strong> ${new Date().toISOString()}</p><p>Seed jobs have been paused (set back to pending). They will resume automatically on the next runner cycle once models are healthy. Check your API balances.</p>`
+        })
+      })
+      console.log('Pause alert emailed to therese@tagmakessc.com')
+    } catch (e) { console.error('Pause alert email failed:', e.message) }
+  }
+}
+
+function checkModelFailureRate(modelOutputs, modelName) {
+  // Returns number of nulls for a given model across all jobs
+  let fails = 0, total = 0
+  for (const outputs of modelOutputs) {
+    total++
+    if (!outputs[modelName]) fails++
+  }
+  return { fails, total, rate: total ? fails / total : 0 }
+}
+
 // ── MAIN ────────────────────────────────────────────────────
 
 async function run() {
@@ -1041,7 +1099,14 @@ async function run() {
 
   // Process in priority order
   if (proxyJobs.length) await processViaProxy(proxyJobs)
-  if (cheapJobs.length) await processDirectCheap(cheapJobs)
+  if (cheapJobs.length) {
+    const cheapOk = await processDirectCheap(cheapJobs)
+    if (!cheapOk && batchJobs.length) {
+      console.warn('[pause] Cheap path had model failures - pausing batch jobs')
+      await pauseSeedJobs(batchJobs, 'Paused: model failures in cheap path')
+      batchJobs.length = 0
+    }
+  }
   if (batchJobs.length) await processBatchSerperSeed(batchJobs)
 
   console.log('Run complete.')
