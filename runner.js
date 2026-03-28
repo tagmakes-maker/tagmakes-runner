@@ -135,7 +135,8 @@ async function run() {
 
       // 24-hour requeue cap: max 2 per domain per day (public audits only)
       const accessCode = extractAccessCode(job.source)
-      const isPublic = !accessCode || accessCode === 'public'
+      const isAdminJob = (job.source || '').startsWith('requeue_') || (job.source || '').startsWith('admin_') || (job.source || '').startsWith('rerun_')
+      const isPublic = !isAdminJob && (!accessCode || accessCode === 'public')
       if (isPublic) {
         const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
         const { count: recentCount } = await supabase
