@@ -236,6 +236,19 @@ async function run() {
         throw new Error(`Worker error ${response.status}: ${resultText}`)
       }
 
+      // Check model completeness - pause all seed jobs if any returns <4 models
+      try {
+        const resultCheck = JSON.parse(resultText)
+        const parsedCheck = resultCheck.text ? JSON.parse(resultCheck.text) : resultCheck
+        const modelsTotal = parsedCheck.models_total || 0
+        const modelsFailed = parsedCheck.models_failed || []
+        if (isSeedJob && modelsTotal < 4 && !seedPaused) {
+          seedPaused = true
+          console.warn(`${tag} Only ${modelsTotal}/4 models for ${siteUrl} (failed: ${modelsFailed.join(', ')}) - PAUSING ALL SEEDS`)
+          await pauseSeedJobs(`${modelsFailed.join(', ')} failed on ${siteUrl} (${modelsTotal}/4 models)`)
+        }
+      } catch(e) { /* parse failed, still mark done */ }
+
       await supabase
         .from('audit_queue')
         .update({
