@@ -305,6 +305,17 @@ async function run() {
       }
     }
   }
+
+  // Run automated trial email checks
+  try {
+    console.log('Checking trial emails...')
+    const runnerKey = SUPABASE_SERVICE_ROLE.slice(-8)
+    const trialRes = await fetch(AUDIT_WORKER_URL + '/admin/check-trials?key=' + encodeURIComponent(runnerKey))
+    const trialData = await trialRes.json()
+    if (trialData.midSent || trialData.endSent) {
+      console.log(`Trial emails: ${trialData.midSent} mid-trial, ${trialData.endSent} trial-end sent (${trialData.checked} checked)`)
+    }
+  } catch(e) { console.warn('Trial check failed (non-fatal):', e.message) }
 }
 
 run()
