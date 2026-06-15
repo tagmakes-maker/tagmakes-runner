@@ -147,15 +147,40 @@ async function run() {
 
   console.log(`Processing ${jobs.length} jobs`)
 
+  // FIX 1: Deduplicate by project_id -- a wave may insert multiple rows per business.
+  // Process only the first row per project in this batch; mark extras done immediately.
+  const seenProjectIds = new Set()
+  const dedupeIds = []
+  for (const job of jobs) {
+    if (seenProjectIds.has(job.project_id)) {
+      dedupeIds.push(job.id)
+    } else {
+      seenProjectIds.add(job.project_id)
+    }
+  }
+  const dedupeIdSet = new Set(dedupeIds)
+  if (dedupeIds.length > 0) {
+    console.log(`Deduping ${dedupeIds.length} extra rows (same project already in this batch)`)
+    for (const id of dedupeIds) {
+      await supabase.from('audit_queue').update({
+        status: 'done',
+        processed_at: new Date().toISOString(),
+        last_error: 'deduped: another row for this project processed in this batch'
+      }).eq('id', id)
+    }
+  }
+  const uniqueJobs = jobs.filter(job => !dedupeIdSet.has(job.id))
+
   let seedFailures = 0
   let seedTotal = 0
   let seedPaused = false
 
-  for (const job of jobs) {
+  for (const job of uniqueJobs) {
     try {
+      // FIX 2: Select primary_category + subindustry so runner can send category to proxy
       const { data: project, error: projectError } = await supabase
         .from('projects')
-        .select('id, domain, location_city')
+        .select('id, domain, location_city, primary_category, subindustry')
         .eq('id', job.project_id)
         .single()
 
@@ -203,14 +228,18 @@ async function run() {
       const useCheap = !accessCode && shouldUseCheapModels(job.source)
       const tag = useCheap ? '[cheap]' : '[proxy]'
 
-      console.log(`${tag} ${siteUrl} | source: ${job.source}`)
+      console.log(`${tag} ${siteUrl} | category: ${project.primary_category || 'unknown'} | source: ${job.source}`)
 
+      // FIX 2: Send classification_source='queue_runner' + category fields so proxy uses bank path.
+      // Do NOT send query field -- proxy must derive queries from category_queries bank, not stored strings.
       const response = await fetch(AUDIT_WORKER_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           siteUrl,
-          query:             job.query,
+          classification_source: 'queue_runner',
+          ...(project.primary_category && { industry: project.primary_category }),
+          ...(project.subindustry      && { subindustry: project.subindustry }),
           accessCode:        accessCode || 'public',
           models:            useCheap ? 'cheap' : undefined,
           location_modifier: project.location_city || undefined
@@ -236,6 +265,22 @@ async function run() {
         }
         throw new Error(`Worker error ${response.status}: ${resultText}`)
       }
+
+      // FIX 3: If proxy signals no locked bank set, hold the row for manual seeding.
+      // Never run the "best "/"top rated " concatenation garbage on unrecognized categories.
+      try {
+        const resultJson = JSON.parse(resultText)
+        if (resultJson.needsBank) {
+          const cat = resultJson.category || project.primary_category || 'unknown'
+          console.log(`Held (needs_bank): ${siteUrl} | category: ${cat}`)
+          await supabase.from('audit_queue').update({
+            status:       'needs_bank',
+            processed_at: new Date().toISOString(),
+            last_error:   `No locked bank set for: ${cat}`
+          }).eq('id', job.id)
+          continue
+        }
+      } catch(e) { /* non-fatal; if parse fails, proceed to normal done path */ }
 
       // Check model completeness - pause all seed jobs if any returns <4 models
       try {
@@ -320,4 +365,3 @@ async function run() {
 }
 
 run()
-
