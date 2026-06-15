@@ -155,7 +155,7 @@ async function run() {
     try {
       const { data: project, error: projectError } = await supabase
         .from('projects')
-        .select('id, domain')
+        .select('id, domain, location_city')
         .eq('id', job.project_id)
         .single()
 
@@ -210,9 +210,10 @@ async function run() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           siteUrl,
-          query:      job.query,
-          accessCode: accessCode || 'public',
-          models:     useCheap ? 'cheap' : undefined
+          query:             job.query,
+          accessCode:        accessCode || 'public',
+          models:            useCheap ? 'cheap' : undefined,
+          location_modifier: project.location_city || undefined
         })
       })
 
@@ -319,3 +320,4 @@ async function run() {
 }
 
 run()
+
