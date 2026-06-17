@@ -1,7 +1,7 @@
 const { createClient } = require('@supabase/supabase-js')
 
-const SUPABASE_URL = 'https://ttukoeysolvqimcamddq.supabase.co'
-const SUPABASE_SERVICE_ROLE = 'sb_publishable_f_GNhFK4MUWETQbCCTPcMw_eMXVVmiz'
+const SUPABASE_URL = process.env.SUPABASE_URL
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_KEY
 const AUDIT_WORKER_URL = 'https://tagmakes-proxy.tagmakes.workers.dev'
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE)
@@ -9,7 +9,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE)
 async function run() {
     console.log('Claiming jobs...')
 
-    const { data: jobs, error } = await supabase.rpc('claim_audit_queue', { batch_size:  })
+    const { data: jobs, error } = await supabase.rpc('claim_audit_queue', { batch_size: 50 })
 
     console.log('Claim result:', { jobsCount: jobs?.length || 0, error })
 
