@@ -1,13 +1,100 @@
-// Updated: July 10, 2026 (pre-check: GET redirect follow, bot_blocked, robots_blocks_ai)
+// Updated: July 14, 2026 (credit/quota circuit breaker)
 const { createClient } = require('@supabase/supabase-js')
 
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_KEY
 const AUDIT_WORKER_URL = 'https://tagmakes-proxy.tagmakes.workers.dev'
+const RESEND_KEY = process.env.RESEND_KEY
+const ALERT_EMAIL = 'therese@tagmakessc.com'
+const ALERT_FROM = 'TaG Makes <reports@tagmakessc.com>'
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE)
 
 const AI_CRAWLERS = ['GPTBot', 'ClaudeBot', 'anthropic-ai', 'Google-Extended', 'PerplexityBot', 'CCBot']
+
+// Per-model API error strings get wrapped as "<Model> error: " + JSON.stringify(errorBody)
+// by tagmakes-proxy-worker.js's callClaude/callChatGPT/callGemini/callPerplexity. Note the
+// worker still returns HTTP 200 for a v2 audit even when one or more models fail (per-model
+// errors are absorbed via Promise.allSettled into a `modelErrors` field) -- so credit/quota
+// exhaustion has to be detected by scanning response text, not just non-2xx status.
+const CREDIT_EXHAUSTION_PATTERNS = {
+    claude: /credit balance is too low/i,
+    chatgpt: /insufficient_quota/i,
+    gemini: /RESOURCE_EXHAUSTED|billing account/i,
+    perplexity: /quota/i
+}
+
+function detectCreditExhaustion(text) {
+    if (!text) return null
+    for (const [model, pattern] of Object.entries(CREDIT_EXHAUSTION_PATTERNS)) {
+        if (pattern.test(text)) return model
+    }
+    return null
+}
+
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+}
+
+async function sendCreditAlertEmail(model, errorText) {
+    if (!RESEND_KEY) {
+        console.error(`RESEND_KEY not set -- could not send credit alert email for ${model}`)
+        return
+    }
+    try {
+        const res = await fetch('https://api.resend.com/emails', {
+            method: 'POST',
+            headers: { 'Authorization': 'Bearer ' + RESEND_KEY, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                from: ALERT_FROM,
+                to: ALERT_EMAIL,
+                subject: `AUDIT QUEUE PAUSED: ${model} out of credits`,
+                html: `<p>The audit runner detected a billing/quota-exhausted error from <strong>${model}</strong> and paused the audit queue (all 'pending' rows set to 'paused').</p><pre style="white-space:pre-wrap">${escapeHtml(errorText || '')}</pre>`
+            })
+        })
+        if (!res.ok) {
+            console.error('Credit alert email failed:', await res.text())
+        }
+    } catch (e) {
+        console.error('Credit alert email error:', e.message)
+    }
+}
+
+// Pauses all pending queue rows and sends one alert email. Skips the email (but still logs)
+// if there were zero pending rows to pause -- that means an earlier trip this outage already
+// paused the queue, so this isn't a new incident.
+async function tripCreditBreaker(model, errorText) {
+    console.error(`CIRCUIT BREAKER TRIPPED: ${model} credit/quota exhausted -- ${errorText}`)
+
+    const { count: pendingCount, error: countError } = await supabase
+        .from('audit_queue')
+        .select('id', { count: 'exact', head: true })
+        .eq('status', 'pending')
+
+    if (countError) {
+        console.error('Circuit breaker: failed to count pending rows:', countError)
+    }
+
+    if (!pendingCount) {
+        console.log('Circuit breaker: no pending rows to pause -- queue already paused from an earlier trip this outage, skipping duplicate alert email')
+        return
+    }
+
+    const note = `CIRCUIT BREAKER: ${model} credit/quota exhausted - ${(errorText || '').slice(0, 500)}`
+
+    const { error: pauseError } = await supabase
+        .from('audit_queue')
+        .update({ status: 'paused', last_error: note })
+        .eq('status', 'pending')
+
+    if (pauseError) {
+        console.error('Circuit breaker: failed to pause pending rows:', pauseError)
+    } else {
+        console.log(`Circuit breaker: paused ${pendingCount} pending row(s)`)
+    }
+
+    await sendCreditAlertEmail(model, errorText)
+}
 
 function checkRobotsForAiAgents(txt) {
     const lines = txt.split(/\r?\n/).map(l => l.split('#')[0].trim())
@@ -105,6 +192,10 @@ async function run() {
     console.log(`Processing ${jobs.length} jobs`)
 
     for (const job of jobs) {
+        let breakerTripped = false
+        let breakerModel = null
+        let breakerErrorText = null
+
         try {
             const { data: project, error: projectError } = await supabase
                 .from('projects')
@@ -141,6 +232,13 @@ async function run() {
             })
 
             const resultText = await response.text()
+
+            const embeddedCreditModel = detectCreditExhaustion(resultText)
+            if (embeddedCreditModel) {
+                breakerTripped = true
+                breakerModel = embeddedCreditModel
+                breakerErrorText = resultText
+            }
 
             if (!response.ok) {
                 throw new Error(`Worker error ${response.status}: ${resultText}`)
@@ -195,15 +293,40 @@ async function run() {
         } catch (err) {
             console.error('Audit failed:', err.message)
 
-            const tooManyAttempts = (job.attempts || 0) >= 3
+            if (!breakerTripped) {
+                const caughtCreditModel = detectCreditExhaustion(err.message)
+                if (caughtCreditModel) {
+                    breakerTripped = true
+                    breakerModel = caughtCreditModel
+                    breakerErrorText = err.message
+                }
+            }
 
-            await supabase
-                .from('audit_queue')
-                .update({
-                    status: tooManyAttempts ? 'failed' : 'pending',
-                    last_error: err.message
-                })
-                .eq('id', job.id)
+            if (breakerTripped) {
+                await supabase
+                    .from('audit_queue')
+                    .update({
+                        status: 'paused',
+                        last_error: `CIRCUIT BREAKER: ${breakerModel} credit/quota exhausted - ${err.message}`.slice(0, 2000)
+                    })
+                    .eq('id', job.id)
+            } else {
+                const tooManyAttempts = (job.attempts || 0) >= 3
+
+                await supabase
+                    .from('audit_queue')
+                    .update({
+                        status: tooManyAttempts ? 'failed' : 'pending',
+                        last_error: err.message
+                    })
+                    .eq('id', job.id)
+            }
+        }
+
+        if (breakerTripped) {
+            await tripCreditBreaker(breakerModel, breakerErrorText)
+            console.log('Circuit breaker tripped -- halting remaining jobs in this batch.')
+            break
         }
     }
 }
