@@ -12,6 +12,11 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE)
 
 const AI_CRAWLERS = ['GPTBot', 'ClaudeBot', 'anthropic-ai', 'Google-Extended', 'PerplexityBot', 'CCBot']
 
+// Mirrors LOCATION_TRUST_CUTOFF in tagmakes-proxy-worker.js -- keep both in sync.
+// Project rows created before this date may carry a silent location default
+// (e.g. "Charleston, SC") with no raw_location_text evidence behind it.
+const LOCATION_TRUST_CUTOFF = new Date('2026-07-01T00:00:00Z')
+
 // Per-model API error strings get wrapped as "<Model> error: " + JSON.stringify(errorBody)
 // by tagmakes-proxy-worker.js's callClaude/callChatGPT/callGemini/callPerplexity. Note the
 // worker still returns HTTP 200 for a v2 audit even when one or more models fail (per-model
@@ -199,7 +204,7 @@ async function run() {
         try {
             const { data: project, error: projectError } = await supabase
                 .from('projects')
-                .select('id, domain, primary_category, subindustry, location_city')
+                .select('id, domain, primary_category, subindustry, location_city, raw_location_text, created_at')
                 .eq('id', job.project_id)
                 .single()
 
@@ -218,6 +223,13 @@ async function run() {
 
             console.log(`Running audit for ${siteUrl} | ${job.query}`)
 
+            // Only pass a location if the project record is verified (has detection
+            // evidence, or was created after the trust cutoff). Unverified records send
+            // no location_modifier so the proxy resolver's distrust logic and Haiku
+            // pre-detect can run instead of inheriting a stale/defaulted city.
+            const locationVerified = !!project.raw_location_text ||
+                (project.created_at && new Date(project.created_at) >= LOCATION_TRUST_CUTOFF)
+
             const response = await fetch(AUDIT_WORKER_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -227,7 +239,7 @@ async function run() {
                     classification_source: 'queue_runner',
                     industry: project.primary_category || undefined,
                     subindustry: project.subindustry || undefined,
-                    location_modifier: project.location_city || undefined
+                    location_modifier: locationVerified ? (project.location_city || undefined) : undefined
                 })
             })
 
