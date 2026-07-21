@@ -229,6 +229,7 @@ async function run() {
                 body: JSON.stringify({
                     siteUrl,
                     query: job.query,
+                    source: job.source,
                     classification_source: 'queue_runner',
                     industry: project.primary_category || undefined,
                     subindustry: project.subindustry || undefined
