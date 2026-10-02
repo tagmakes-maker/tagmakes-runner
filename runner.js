@@ -259,6 +259,17 @@ async function run() {
                 throw new Error(`Worker error ${response.status}: ${resultText}`)
             }
 
+            // 2xx is not proof an audit row was written: needsLocation/needsBank/rateLimited
+            // are 200s with no insert. Do not mark these done.
+            try {
+                const peek = JSON.parse(resultText)
+                if (peek && (peek.needsLocation || peek.needsBank || peek.rateLimited)) {
+                    throw new Error(`Worker returned no-audit response (200): ${resultText.slice(0, 300)}`)
+                }
+            } catch (e) {
+                if (e.message.startsWith('Worker returned no-audit')) throw e
+            }
+
             await supabase
                 .from('audit_queue')
                 .update({
