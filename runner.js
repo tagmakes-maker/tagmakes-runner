@@ -1,4 +1,4 @@
-// Updated: July 14, 2026 (credit/quota circuit breaker)
+// Updated: October 1, 2026 (forward accessCode parsed from job.source to the audit worker, ClickUp wdvrdayqg7 -- previously every audit created here landed access_code="public" and never showed up in any agency's /console; distinct from the existing source:job.source passthrough below, which the worker does not read as accessCode). Previous entry: July 14, 2026 (credit/quota circuit breaker)
 const { createClient } = require('@supabase/supabase-js')
 
 const SUPABASE_URL = process.env.SUPABASE_URL
@@ -223,6 +223,15 @@ async function run() {
             // unverified records) is the single source of truth for location resolution.
             // A runner-supplied bare city with no state was short-circuiting that lookup
             // and always failing the worker's clean "City ST" shape check.
+
+            // Forward the agency code from the queue row's source (e.g. agency_trial_FULLGALLOP_20261001
+            // or agency_dashboard_TAGMAKES2026) as accessCode -- the worker's main audit route reads
+            // body.accessCode specifically (not body.source), and defaults to access_code="public" when
+            // it's absent. Without this, every audit this runner creates for an agency job is invisible
+            // in that agency's /console (ClickUp wdvrdayqg7).
+            const sourceCodeMatch = (job.source || '').match(/^agency_(?:trial|dashboard)_([A-Z0-9]+)/i)
+            const accessCode = sourceCodeMatch ? sourceCodeMatch[1].toUpperCase() : undefined
+
             const response = await fetch(AUDIT_WORKER_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -232,7 +241,8 @@ async function run() {
                     source: job.source,
                     classification_source: 'queue_runner',
                     industry: project.primary_category || undefined,
-                    subindustry: project.subindustry || undefined
+                    subindustry: project.subindustry || undefined,
+                    accessCode
                 })
             })
 
