@@ -1,4 +1,4 @@
-// Updated: October 1, 2026 (forward accessCode parsed from job.source to the audit worker, ClickUp wdvrdayqg7 -- previously every audit created here landed access_code="public" and never showed up in any agency's /console; distinct from the existing source:job.source passthrough below, which the worker does not read as accessCode). Previous entry: July 14, 2026 (credit/quota circuit breaker)
+// Updated: October 13, 2026 (auto-reaudit-30d rows inherit the project's latest non-public access_code so agency re-audits reach the agency console, ClickUp wdvrdayqg7). Previous entry: October 1, 2026 (forward accessCode parsed from job.source to the audit worker, ClickUp wdvrdayqg7 -- previously every audit created here landed access_code="public" and never showed up in any agency's /console; distinct from the existing source:job.source passthrough below, which the worker does not read as accessCode). Previous entry: July 14, 2026 (credit/quota circuit breaker)
 const { createClient } = require('@supabase/supabase-js')
 
 const SUPABASE_URL = process.env.SUPABASE_URL
@@ -230,7 +230,26 @@ async function run() {
             // it's absent. Without this, every audit this runner creates for an agency job is invisible
             // in that agency's /console (ClickUp wdvrdayqg7).
             const sourceCodeMatch = (job.source || '').match(/^agency_(?:trial|dashboard)_([A-Z0-9]+)/i)
-            const accessCode = sourceCodeMatch ? sourceCodeMatch[1].toUpperCase() : undefined
+            let accessCode = sourceCodeMatch ? sourceCodeMatch[1].toUpperCase() : undefined
+
+            // Oct 13 2026 (ClickUp wdvrdayqg7): auto-reaudit-30d rows (pg_cron trigger_due_reaudits) carry no code in
+            // their source, so re-audits of agency domains saved as access_code="public" and never reached the agency
+            // /console. Inherit the code from the project's most recent audit that has a non-public one.
+            if (!accessCode && job.source === 'auto-reaudit-30d') {
+                try {
+                    const { data: prior } = await supabase
+                        .from('audits')
+                        .select('access_code')
+                        .eq('project_id', job.project_id)
+                        .not('access_code', 'is', null)
+                        .neq('access_code', 'public')
+                        .order('created_at', { ascending: false })
+                        .limit(1)
+                    if (prior && prior[0] && /^[A-Z0-9]+$/i.test(prior[0].access_code)) accessCode = prior[0].access_code.toUpperCase()
+                } catch (e) {
+                    console.log('Access code inherit skipped:', e.message)
+                }
+            }
 
             const response = await fetch(AUDIT_WORKER_URL, {
                 method: 'POST',
