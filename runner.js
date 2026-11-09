@@ -1,4 +1,4 @@
-// Updated: October 13, 2026 (auto-reaudit-30d rows inherit the project's latest non-public access_code so agency re-audits reach the agency console, ClickUp wdvrdayqg7). Previous entry: October 1, 2026 (forward accessCode parsed from job.source to the audit worker, ClickUp wdvrdayqg7 -- previously every audit created here landed access_code="public" and never showed up in any agency's /console; distinct from the existing source:job.source passthrough below, which the worker does not read as accessCode). Previous entry: July 14, 2026 (credit/quota circuit breaker)
+// Updated: November 9, 2026 (forward agency_api_v1_ codes as accessCode; send queue_id so the worker skips the second charge on rows already charged at queue time). Previous entry: October 13, 2026 (auto-reaudit-30d rows inherit the project's latest non-public access_code so agency re-audits reach the agency console, ClickUp wdvrdayqg7). Previous entry: October 1, 2026 (forward accessCode parsed from job.source to the audit worker, ClickUp wdvrdayqg7 -- previously every audit created here landed access_code="public" and never showed up in any agency's /console; distinct from the existing source:job.source passthrough below, which the worker does not read as accessCode). Previous entry: July 14, 2026 (credit/quota circuit breaker)
 const { createClient } = require('@supabase/supabase-js')
 
 const SUPABASE_URL = process.env.SUPABASE_URL
@@ -229,7 +229,8 @@ async function run() {
             // body.accessCode specifically (not body.source), and defaults to access_code="public" when
             // it's absent. Without this, every audit this runner creates for an agency job is invisible
             // in that agency's /console (ClickUp wdvrdayqg7).
-            const sourceCodeMatch = (job.source || '').match(/^agency_(?:trial|dashboard)_([A-Z0-9]+)/i)
+            // Nov 9 2026: agency_api_v1_<code> rows (X-Agency-Key queue) forward their code too, so API audits reach that agency's /console.
+            const sourceCodeMatch = (job.source || '').match(/^agency_(?:trial|dashboard|api_v1)_([A-Z0-9]+)/i)
             let accessCode = sourceCodeMatch ? sourceCodeMatch[1].toUpperCase() : undefined
 
             // Oct 13 2026 (ClickUp wdvrdayqg7): auto-reaudit-30d rows (pg_cron trigger_due_reaudits) carry no code in
@@ -261,7 +262,9 @@ async function run() {
                     classification_source: 'queue_runner',
                     industry: project.primary_category || undefined,
                     subindustry: project.subindustry || undefined,
-                    accessCode
+                    accessCode,
+                    // Nov 9 2026: lets the worker see this row was already charged at queue time (dashboard, api/v1) and skip a second charge
+                    queue_id: job.id
                 })
             })
 
